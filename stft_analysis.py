@@ -21,16 +21,26 @@ STFT Hyperparameters being optimised
                  Higher → finer time steps (more redundancy).
                  Range: 0.50 … 0.95
 
-Optimisation objective — Time-Frequency Resolution Score (TFRS)
----------------------------------------------------------------
-TFRS measures how well energy is concentrated around the dominant
-frequency peak in the TF plane:
+Optimisation objectives — Jin Yan (2020) metrics J₁ and J₂
+-----------------------------------------------------------
+Two metrics from: Jin Yan, "A Comparison of Time-Frequency Methods for
+Real-Time Application to High-Rate Dynamic Systems", Vibration 2020, 3.
 
-    TFRS = E_band / E_total
+  J₁  =  (1/n) Σ |ω̂ᵢ − ωᵢ|          (mean absolute IF tracking error)
 
-where E_band is the STFT energy within ±10 % of the dominant frequency,
-and E_total is the total STFT energy. A higher score means the representation
-is sharper and less smeared across irrelevant frequencies.
+        Lower is better. Measures how accurately the STFT tracks the
+        known excitation frequency at each time step. Ground truth ωᵢ
+        is the dominant FFT frequency of the full signal (known for
+        simulated data).
+
+  J₂  =  ∬ log|TFR(t,ω)|³ dt dω      (Rényi entropy / energy concentration)
+
+        Higher is better. Rewards a sharp, concentrated TF distribution.
+        Penalises smearing regardless of where energy sits in the TF plane.
+
+The grid search maximises J₂ (energy concentration) because it requires
+no external ground-truth frequency tracking on a per-window basis.
+J₁ is computed once for the best configuration as a validation metric.
 """
 
 from __future__ import annotations
@@ -65,26 +75,38 @@ def _nperseg_candidates(n_samples: int) -> list[int]:
     return sorted({int(2 ** round(e)) for e in exponents})
 
 
-def _tfrs(signal: np.ndarray, fs: float,
+def _j2(signal: np.ndarray, fs: float,
           nperseg: int, window, overlap_frac: float) -> float:
     """
-    Time-Frequency Resolution Score (TFRS).
-    Higher is better — energy concentrated near the dominant frequency.
+    J₂ — Rényi entropy (Jin Yan 2020, eq. 8).
+    J₂ = ∬ log|TFR(t,ω)|³ dt dω
+    Higher is better: a sharp, concentrated TF distribution gives a larger value.
     """
     noverlap = int(nperseg * overlap_frac)
     _, _, Zxx = stft(signal, fs=fs, window=window,
                      nperseg=nperseg, noverlap=noverlap)
-    power = np.abs(Zxx) ** 2                      # (freq_bins, time_frames)
-    e_total = power.sum()
-    if e_total == 0:
-        return 0.0
-    # Dominant frequency bin (by total power across time)
-    dominant_bin = int(np.argmax(power.sum(axis=1)))
-    band = max(1, int(0.10 * dominant_bin))        # ±10 % of dominant bin index
-    lo = max(0, dominant_bin - band)
-    hi = min(power.shape[0], dominant_bin + band + 1)
-    e_band = power[lo:hi, :].sum()
-    return float(e_band / e_total)
+    magnitude = np.abs(Zxx)
+    # Avoid log(0): add small floor relative to max magnitude
+    floor = 1e-12 * magnitude.max() if magnitude.max() > 0 else 1e-12
+    magnitude = np.maximum(magnitude, floor)
+    return float(np.sum(np.log(magnitude ** 3)))
+
+
+def _j1(signal: np.ndarray, fs: float,
+        nperseg: int, window, overlap_frac: float,
+        true_freq_hz: float) -> float:
+    """
+    J₁ — mean absolute instantaneous frequency tracking error (Jin Yan 2020, eq. 8).
+    J₁ = (1/n) Σ |ω̂ᵢ − ωᵢ|   (in Hz)
+    Lower is better.  true_freq_hz is the known excitation frequency.
+    """
+    noverlap = int(nperseg * overlap_frac)
+    freqs, _, Zxx = stft(signal, fs=fs, window=window,
+                         nperseg=nperseg, noverlap=noverlap)
+    power = np.abs(Zxx) ** 2               # (freq_bins, time_frames)
+    # Estimated IF at each time frame = frequency bin with maximum power
+    estimated_if = freqs[np.argmax(power, axis=0)]  # (time_frames,)
+    return float(np.mean(np.abs(estimated_if - true_freq_hz)))
 
 
 def _window_label(window) -> str:
@@ -108,15 +130,23 @@ def optimise_and_plot(
     fs = _fs_from_time(t_us)
     nperseg_list = _nperseg_candidates(len(signal))
 
-    # ── Grid search ──────────────────────────────────────────────────────────
-    results = []   # (score, nperseg, window, overlap_frac)
+    # Ground-truth excitation frequency = dominant FFT bin of the full signal
+    fft_mag  = np.abs(np.fft.rfft(signal))
+    fft_freq = np.fft.rfftfreq(len(signal), d=1.0 / fs)
+    true_freq_hz = float(fft_freq[np.argmax(fft_mag)])
+
+    # ── Grid search — maximise J₂ (Rényi entropy) ────────────────────────────
+    results = []   # (j2_score, nperseg, window, overlap_frac)
     for nperseg, window, ovlp in itertools.product(
             nperseg_list, WINDOWS, OVERLAP_FRACS):
-        score = _tfrs(signal, fs, nperseg, window, ovlp)
+        score = _j2(signal, fs, nperseg, window, ovlp)
         results.append((score, nperseg, window, ovlp))
 
     results.sort(key=lambda x: -x[0])
-    best_score, best_nperseg, best_window, best_ovlp = results[0]
+    best_j2, best_nperseg, best_window, best_ovlp = results[0]
+
+    # J₁ for best configuration (validation metric — lower is better)
+    best_j1 = _j1(signal, fs, best_nperseg, best_window, best_ovlp, true_freq_hz)
 
     # ── Figure layout ─────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(16, 10))
@@ -129,7 +159,7 @@ def optimise_and_plot(
     ax_stft_d = fig.add_subplot(gs[1, :2])  # default STFT
     ax_stft_b = fig.add_subplot(gs[1, 2])   # best STFT
 
-    # ── Panel 1: TFRS vs nperseg (best window & overlap fixed) ───────────────
+    # ── Panel 1: J₂ vs nperseg ───────────────────────────────────────────────
     nperseg_scores: dict[int, list] = {}
     for score, np_, win, ovlp in results:
         nperseg_scores.setdefault(np_, []).append(score)
@@ -138,12 +168,12 @@ def optimise_and_plot(
     ax_score.plot(np_vals, np_means, "o-", color=colour)
     ax_score.axvline(best_nperseg, color="gray", linestyle="--", alpha=0.6)
     ax_score.set_xlabel("nperseg (samples)")
-    ax_score.set_ylabel("Mean TFRS")
-    ax_score.set_title("Score vs window length")
+    ax_score.set_ylabel("Mean J₂ (Rényi entropy)")
+    ax_score.set_title("J₂ vs window length")
     ax_score.set_xscale("log", base=2)
     ax_score.grid(True, alpha=0.3)
 
-    # ── Panel 2: TFRS vs window type ─────────────────────────────────────────
+    # ── Panel 2: J₂ vs window type ───────────────────────────────────────────
     win_scores: dict[str, list] = {}
     for score, np_, win, ovlp in results:
         wl = _window_label(win)
@@ -156,12 +186,12 @@ def optimise_and_plot(
         if wl == best_wl:
             bar.set_edgecolor("black")
             bar.set_linewidth(2)
-    ax_win.set_ylabel("Mean TFRS")
-    ax_win.set_title("Score vs window function")
-    ax_win.set_ylim(0, max(win_means) * 1.15)
+    ax_win.set_ylabel("Mean J₂ (Rényi entropy)")
+    ax_win.set_title("J₂ vs window function")
+    ax_win.set_ylim(min(win_means) * 1.02, max(win_means) * 1.02)
     ax_win.grid(True, axis="y", alpha=0.3)
 
-    # ── Panel 3: TFRS vs overlap_frac ────────────────────────────────────────
+    # ── Panel 3: J₂ vs overlap_frac ──────────────────────────────────────────
     ovlp_scores: dict[float, list] = {}
     for score, np_, win, ovlp in results:
         ovlp_scores.setdefault(ovlp, []).append(score)
@@ -171,8 +201,8 @@ def optimise_and_plot(
     best_ovlp_label = f"{best_ovlp:.0%}"
     ax_ovlp.axvline(best_ovlp_label, color="gray", linestyle="--", alpha=0.6)
     ax_ovlp.set_xlabel("Overlap fraction")
-    ax_ovlp.set_ylabel("Mean TFRS")
-    ax_ovlp.set_title("Score vs overlap fraction")
+    ax_ovlp.set_ylabel("Mean J₂ (Rényi entropy)")
+    ax_ovlp.set_title("J₂ vs overlap fraction")
     ax_ovlp.grid(True, alpha=0.3)
 
     # ── Panel 4: Default STFT (hann, nperseg=256, overlap=0.75) ──────────────
@@ -194,15 +224,16 @@ def optimise_and_plot(
     _plot_stft(ax_stft_b, best_nperseg, best_window, best_ovlp,
                f"Best STFT  (nperseg={best_nperseg}, "
                f"{_window_label(best_window)}, {best_ovlp:.0%} overlap)\n"
-               f"TFRS = {best_score:.4f}")
+               f"J₂={best_j2:.1f}  |  J₁={best_j1/1e3:.2f} kHz")
 
     plt.show()
 
     return {
-        "nperseg": best_nperseg,
-        "window":  best_window,
+        "nperseg":      best_nperseg,
+        "window":       best_window,
         "overlap_frac": best_ovlp,
-        "tfrs": best_score,
+        "j2":           best_j2,
+        "j1_hz":        best_j1,
     }
 
 
@@ -243,8 +274,8 @@ def main() -> None:
     print(f"  Best hyperparameters summary")
     print(f"{'='*72}")
     print(f"  {'Dist':>6}  {'Sig':>4}  {'nperseg':>8}  {'window':<16}  "
-          f"{'overlap':>8}  {'TFRS':>8}")
-    print(f"  {'-'*6}  {'-'*4}  {'-'*8}  {'-'*16}  {'-'*8}  {'-'*8}")
+          f"{'overlap':>8}  {'J2':>12}  {'J1 (kHz)':>10}")
+    print(f"  {'-'*6}  {'-'*4}  {'-'*8}  {'-'*16}  {'-'*8}  {'-'*12}  {'-'*10}")
     for row in summary:
         for sig_key in ("f", "2f"):
             b = row[sig_key]
@@ -252,7 +283,8 @@ def main() -> None:
                   f"{b['nperseg']:>8}  "
                   f"{_window_label(b['window']):<16}  "
                   f"{b['overlap_frac']:>7.0%}  "
-                  f"{b['tfrs']:>8.4f}")
+                  f"{b['j2']:>12.1f}  "
+                  f"{b['j1_hz']/1e3:>10.2f}")
 
 
 if __name__ == "__main__":
