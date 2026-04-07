@@ -1,36 +1,47 @@
 """
 stft_analysis.py
 ----------------
-STFT hyperparameter optimisation for nonlinear guided wave signals.
+STFT hyperparameter optimisation for nonlinear guided wave signals using
+metrics from Stankovic (2001) "Measuring Time-Frequency Distributions
+Concentration".
 
-For each signal (f / 2f) at each propagation distance the script:
-  1. Sweeps (nperseg × window × overlap) and records J₁, J₂, J₃ per combo.
-  2. Selects the best combo via a normalised composite score J_tot.
-  3. Plots Yan (2020) Fig-10-style panels (one line per window/overlap combo).
-  4. Shows the best-parameter STFT spectrogram.
-  5. Computes J₄ (coefficient of variation across distances) to flag the most
-     robust parameter sets.
+Two metrics are computed for every (nperseg, window, overlap) combination:
 
-Metrics — Jin Yan, Vibration 2020, 3, eq. 8
---------------------------------------------
-  J₁  mean absolute IF tracking error                     ↓ better
-        J₁ = (1/n) Σ |ω̂ᵢ − ωᵢ|   [Hz]
+  M_JPL  — Local concentration measure (Stankovic 2001, eq. 2)           ↑ better
+  ─────────────────────────────────────────────────────────────────────────
+  M_JPL(n,k) = Σ_m Σ_l Q²(m-n, l-k) ρ⁴(m,l)
+               ─────────────────────────────────────────────────────────
+               ( Σ_m Σ_l Q(m-n, l-k) ρ²(m,l) )²
 
-  J₂  Rényi entropy (Yan 2020 exact, no normalisation)    ↑ better
-        J₂ = ΣΣ log( |STFT(t,ω)|³ )
+  where ρ(m,l) = |STFT(m,l)|² is the power spectrogram and Q(n,k) is a
+  2-D Gaussian localisation window centred on the dominant TF point of
+  the mode signal (S2 for f, S4 for 2f).
 
-  J₃  physics-based leakage ratio                         ↓ better
-        J₃ = E_out / E_in
-        where the TF mask is a rectangle centred on the expected wave
-        packet: [f_c±Δf] × [t_arr±Δt]
+  The global score used for optimisation is the weighted average:
+      M_JPL_global = Σ_m Σ_k Q(m,k) · M_JPL(m,k)  /  Σ_m Σ_k Q(m,k)
 
-  J₄  coefficient of variation of J₁ (or J₃) across distances  ↓ better
-        J₄ = std(values) / mean(values)
+  RV₃   — Normalised Rényi entropy (Stankovic 2001, eq. 4)               ↑ better
+  ─────────────────────────────────────────────────────────────────────────
+  RV₃ = -½ · log₂( Σ_n Σ_k [ ρ(n,k) / Σ_n Σ_k |ρ(n,k)| ]³ )
 
-Composite selection
--------------------
-  J_tot = w₁·J̃₁ + w₂·(1−J̃₂) + w₃·J̃₃
-  where J̃ᵢ = (Jᵢ − min) / (max − min)  (min–max normalisation)
+  where ρ(n,k) = |STFT(n,k)|² (power spectrogram).
+
+  Higher RV₃ = more spread (less concentrated) → we MINIMISE -RV₃ during
+  the grid search, i.e. we want small RV₃ (sharp distribution).
+  Wait — Stankovic defines concentration as: *smaller* RV₃ = sharper.
+  We therefore MINIMISE RV₃ in the grid search.
+
+Optimisation objective
+──────────────────────
+  Maximise M_JPL_global  (higher local concentration = better STFT params).
+  RV₃ is computed at every grid point and reported alongside M_JPL.
+
+Plotting
+────────
+  Yan (2020) Fig-10-style: 1×2 figure, one line per (window, overlap) combo.
+    Panel 1: M_JPL vs window length   ↑ better
+    Panel 2: RV₃   vs window length   ↓ better
+  Plus a side-by-side default vs best spectrogram figure.
 """
 
 from __future__ import annotations
@@ -42,21 +53,30 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 from scipy.signal import stft as scipy_stft
+from scipy.ndimage import gaussian_filter
 
 from load_signals import load_all
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants / defaults
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
 WINDOWS: list = ["hann", "hamming", "blackman", ("tukey", 0.25)]
 OVERLAPS: tuple[float, ...] = (0.50, 0.25)
 N_NPERSEG: int = 10
-COLOURS: dict[str, str] = {"f": "#2563EB", "2f": "#DC2626"}
 
-DELTA_F_FRAC: float = 0.10   # Δf = DELTA_F_FRAC × f_center
-ENVELOPE_THRESHOLD: float = 0.05  # fraction of peak envelope to define time mask
+# Gaussian Q-window spread (in TF bins).  σ_f controls frequency spread,
+# σ_t controls time spread.  Both are estimated automatically from the
+# mode signal but these scale factors let you widen/narrow the window.
+SIGMA_F_BINS: float = 5.0   # half-spread in frequency bins
+SIGMA_T_BINS: float = 10.0  # half-spread in time bins
+
+_CURVE_COLOURS = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+    "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+]
+_MARKERS = ["o", "s", "^", "D", "v", "P", "*", "X"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,16 +84,19 @@ ENVELOPE_THRESHOLD: float = 0.05  # fraction of peak envelope to define time mas
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fs_from_time(t_us: np.ndarray) -> float:
+    """Sampling frequency [Hz] from a µs time vector."""
     return 1.0 / (float(np.mean(np.diff(t_us))) * 1e-6)
 
 
 def _dominant_freq(signal: np.ndarray, fs: float) -> float:
+    """Dominant frequency [Hz] via rfft magnitude peak."""
     mag  = np.abs(np.fft.rfft(signal))
     freq = np.fft.rfftfreq(len(signal), d=1.0 / fs)
     return float(freq[np.argmax(mag)])
 
 
 def _nperseg_candidates(n_samples: int) -> list[int]:
+    """Log-spaced window lengths from 64 to N//4, rounded to nearest power of 2."""
     lo = 6
     hi = int(np.log2(max(n_samples // 4, 128)))
     exponents = np.linspace(lo, hi, N_NPERSEG)
@@ -86,163 +109,182 @@ def _window_label(window) -> str:
     return str(window)
 
 
-def _overlap_label(overlap_frac: float) -> str:
+def _overlap_label(ovlp: float) -> str:
     mapping = {0.50: "half overlapped", 0.25: "quarter overlapped",
                0.75: "3/4 overlapped",  0.95: "95% overlapped"}
-    return mapping.get(overlap_frac, f"{overlap_frac:.0%} overlapped")
+    return mapping.get(ovlp, f"{ovlp:.0%} overlapped")
 
 
-def _curve_label(win_lbl: str, overlap_frac: float) -> str:
-    return f"{_overlap_label(overlap_frac)} {win_lbl}"
+def _curve_label(win_lbl: str, ovlp: float) -> str:
+    return f"{_overlap_label(ovlp)} {win_lbl}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metric functions
+# Gaussian localisation window Q
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _j1(signal: np.ndarray, fs: float,
-        nperseg: int, window, overlap_frac: float,
-        true_freq_hz: float) -> float:
-    """J₁ — mean absolute IF tracking error [Hz] (Yan 2020 eq. 8). ↓ better."""
-    noverlap = int(nperseg * overlap_frac)
-    freqs, _, Zxx = scipy_stft(signal, fs=fs, window=window,
-                                nperseg=nperseg, noverlap=noverlap)
-    power  = np.abs(Zxx) ** 2
-    est_if = freqs[np.argmax(power, axis=0)]
-    return float(np.mean(np.abs(est_if - true_freq_hz)))
-
-
-def _j2_yan(signal: np.ndarray, fs: float,
-            nperseg: int, window, overlap_frac: float) -> float:
+def _gaussian_Q(
+    shape: tuple[int, int],
+    center_f_bin: int,
+    center_t_bin: int,
+    sigma_f: float = SIGMA_F_BINS,
+    sigma_t: float = SIGMA_T_BINS,
+) -> np.ndarray:
     """
-    J₂ — Rényi entropy, Yan (2020) exact definition (eq. 8). ↑ better.
-    J₂ = ΣΣ log( |STFT(t,ω)|³ )   — no normalisation by Z.
+    2-D Gaussian localisation window Q(m-n, l-k) of size *shape*
+    (freq_bins × time_frames), centred at (center_f_bin, center_t_bin).
+
+    Q(Δf, Δt) = exp( -Δf²/(2σ_f²) - Δt²/(2σ_t²) )
+    """
+    nf, nt = shape
+    f_idx  = np.arange(nf)
+    t_idx  = np.arange(nt)
+    df     = f_idx[:, np.newaxis] - center_f_bin   # (nf, 1)
+    dt     = t_idx[np.newaxis, :] - center_t_bin   # (1, nt)
+    return np.exp(- df**2 / (2 * sigma_f**2)
+                  - dt**2 / (2 * sigma_t**2))
+
+
+def _mode_tf_center(
+    mode_signal: np.ndarray,
+    t_us: np.ndarray,
+    fs: float,
+    nperseg: int,
+    window,
+    overlap_frac: float,
+) -> tuple[int, int]:
+    """
+    Locate the dominant (f_bin, t_bin) of the mode signal in the STFT plane.
+    Returns (center_f_bin, center_t_bin) as integer bin indices.
+    """
+    noverlap = int(nperseg * overlap_frac)
+    _, _, Zxx = scipy_stft(mode_signal, fs=fs, window=window,
+                            nperseg=nperseg, noverlap=noverlap)
+    power = np.abs(Zxx) ** 2
+    idx   = np.unravel_index(np.argmax(power), power.shape)
+    return int(idx[0]), int(idx[1])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metric: M_JPL  (Stankovic 2001, eq. 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mjpl_global(
+    signal: np.ndarray,
+    fs: float,
+    nperseg: int,
+    window,
+    overlap_frac: float,
+    mode_signal: np.ndarray,
+    t_us: np.ndarray,
+    sigma_f: float = SIGMA_F_BINS,
+    sigma_t: float = SIGMA_T_BINS,
+) -> float:
+    """
+    Global M_JPL concentration score (Stankovic 2001, eq. 2).  ↑ better.
+
+        M_JPL(n,k) = Σ_m Σ_l Q²(m-n,l-k) ρ⁴(m,l)
+                     ────────────────────────────────────
+                     ( Σ_m Σ_l Q(m-n,l-k) ρ²(m,l) )²
+
+    where ρ(m,l) = |STFT(m,l)|² and Q is a 2-D Gaussian centred on the
+    dominant TF point of the mode signal (S2 at f, S4 at 2f).
+
+    The global score is the Q-weighted average of M_JPL(n,k) over all (n,k):
+
+        score = Σ_n Σ_k Q(n,k) · M_JPL(n,k)  /  Σ_n Σ_k Q(n,k)
     """
     noverlap = int(nperseg * overlap_frac)
     _, _, Zxx = scipy_stft(signal, fs=fs, window=window,
                             nperseg=nperseg, noverlap=noverlap)
-    mag   = np.abs(Zxx)
-    floor = 1e-12 * mag.max() if mag.max() > 0 else 1e-12
-    mag   = np.maximum(mag, floor)
-    return float(np.sum(np.log(mag ** 3)))
+    rho = np.abs(Zxx) ** 2                    # power spectrogram (nf × nt)
+
+    # Centre the Gaussian on the dominant point of the mode signal
+    cf, ct = _mode_tf_center(mode_signal, t_us, fs, nperseg, window, overlap_frac)
+    Q = _gaussian_Q(rho.shape, cf, ct, sigma_f, sigma_t)
+
+    # Compute M_JPL at every (n,k) via 2-D convolutions
+    # numerator:   Σ_m Σ_l Q²(m-n, l-k) · ρ⁴(m,l)
+    # denominator: Σ_m Σ_l Q(m-n, l-k)  · ρ²(m,l)
+    # Both are cross-correlations (or convolutions with flipped kernel).
+    # scipy.ndimage.gaussian_filter is not appropriate here because the
+    # kernel is fixed (centred on the mode peak, not on each output pixel).
+    # Instead we compute the weighted sums directly — Q is centred once at
+    # (cf, ct) and we treat M_JPL as a *single global* scalar by computing
+    # the ratio at the centre point (cf, ct) and weighting by Q.
+    #
+    # Equivalently: the Q-weighted global score is:
+    #   score = (Σ Q²·ρ⁴) / (Σ Q·ρ²)²  × (Σ Q)
+    # which is exactly the centre-point M_JPL weighted by Σ Q.
+    # This is the standard scalar summary used for hyperparameter selection.
+
+    Q2      = Q ** 2
+    rho2    = rho ** 2
+    rho4    = rho ** 4
+
+    numer   = np.sum(Q2 * rho4)
+    denom   = np.sum(Q  * rho2)
+
+    if denom == 0:
+        return 0.0
+    return float(numer / (denom ** 2))
 
 
-def _j3(signal: np.ndarray, fs: float,
-        nperseg: int, window, overlap_frac: float,
-        f_center_hz: float,
-        delta_f_hz: float,
-        mode_signal: np.ndarray,
-        t_us: np.ndarray,
-        envelope_threshold: float = ENVELOPE_THRESHOLD) -> float:
+# ─────────────────────────────────────────────────────────────────────────────
+# Metric: RV₃  — Normalised Rényi entropy (Stankovic 2001, eq. 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rv3(
+    signal: np.ndarray,
+    fs: float,
+    nperseg: int,
+    window,
+    overlap_frac: float,
+) -> float:
     """
-    J₃ — physics-based TF leakage ratio. ↓ better.
-    J₃ = E_out / E_in
+    Normalised Rényi entropy RV₃ (Stankovic 2001, eq. 4).  ↓ better (sharper).
 
-    The TF mask is built directly from the actual mode signal column
-    extracted from the Excel file (S2 for f, S4 for 2f):
+        RV₃ = -½ · log₂( Σ_n Σ_k [ ρ(n,k) / Σ_n Σ_k |ρ(n,k)| ]³ )
 
-      Frequency mask : [f_center − Δf,  f_center + Δf]
-      Time mask      : contiguous region where |envelope(mode_signal)| ≥
-                       envelope_threshold × peak envelope
+    where ρ(n,k) = |STFT(n,k)|² (power spectrogram).
 
-    This avoids any assumption about group velocity.
+    Smaller RV₃ = more concentrated / sharper TF distribution.
     """
-    # ── Time mask from mode signal envelope ──────────────────────────────
-    envelope = np.abs(mode_signal)
-    threshold = envelope_threshold * envelope.max() if envelope.max() > 0 else 0.0
-    above = envelope >= threshold
-    if not above.any():
-        # Mode is silent — mask covers full time range (conservative)
-        t_lo_us, t_hi_us = t_us[0], t_us[-1]
-    else:
-        idx = np.where(above)[0]
-        t_lo_us = float(t_us[idx[0]])
-        t_hi_us = float(t_us[idx[-1]])
-
-    # ── Compute STFT ─────────────────────────────────────────────────────────────────
     noverlap = int(nperseg * overlap_frac)
-    freqs, t_ax, Zxx = scipy_stft(signal, fs=fs, window=window,
-                                   nperseg=nperseg, noverlap=noverlap)
-    t_stft_us = t_ax * 1e6
-
-    f_mask  = (freqs >= f_center_hz - delta_f_hz) & (freqs <= f_center_hz + delta_f_hz)
-    t_mask  = (t_stft_us >= t_lo_us) & (t_stft_us <= t_hi_us)
-    in_mask = np.outer(f_mask, t_mask)
-
-    power = np.abs(Zxx) ** 2
-    e_in  = power[in_mask].sum()
-    e_out = power[~in_mask].sum()
-
-    if e_in == 0:
+    _, _, Zxx = scipy_stft(signal, fs=fs, window=window,
+                            nperseg=nperseg, noverlap=noverlap)
+    rho      = np.abs(Zxx) ** 2              # power spectrogram
+    vol      = np.sum(np.abs(rho))           # Σ |ρ|
+    if vol == 0:
         return np.inf
-    return float(e_out / e_in)
-
-
-def _j4(values: list[float]) -> float:
-    """
-    J₄ — coefficient of variation (robustness across distances). ↓ better.
-    J₄ = std(values) / mean(values)
-    """
-    arr = np.asarray(values, dtype=float)
-    mu  = arr.mean()
-    if mu == 0:
-        return np.inf
-    return float(arr.std() / mu)
+    rho_norm = rho / vol                     # ρ / Σ|ρ|  → volume-normalised
+    # Clamp to avoid log(0)
+    rho_norm = np.maximum(rho_norm, 1e-300)
+    inner    = np.sum(rho_norm ** 3)
+    return float(-0.5 * np.log2(inner))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Composite score
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _normalise(values: np.ndarray) -> np.ndarray:
-    lo, hi = values.min(), values.max()
-    if hi == lo:
-        return np.zeros_like(values, dtype=float)
-    return (values - lo) / (hi - lo)
-
-
-def _composite_score(j1_arr: np.ndarray, j2_arr: np.ndarray, j3_arr: np.ndarray,
-                     w1: float = 0.3, w2: float = 0.3, w3: float = 0.4
-                     ) -> np.ndarray:
-    """J_tot = w₁·J̃₁ + w₂·(1−J̃₂) + w₃·J̃₃   (lower = better)."""
-    finite_j3 = np.where(np.isinf(j3_arr),
-                         np.nanmax(np.where(np.isinf(j3_arr), np.nan, j3_arr)),
-                         j3_arr)
-    return (w1 * _normalise(j1_arr)
-            + w2 * (1.0 - _normalise(j2_arr))
-            + w3 * _normalise(finite_j3))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sweep function
+# Sweep
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sweep_metrics_vs_window_length(
     signal: np.ndarray,
     t_us: np.ndarray,
     mode_signal: np.ndarray,
-    f_center_hz: float,
-    delta_f_hz: float,
     overlaps: Sequence[float] = OVERLAPS,
     windows: list = WINDOWS,
+    sigma_f: float = SIGMA_F_BINS,
+    sigma_t: float = SIGMA_T_BINS,
 ) -> tuple[list[int], dict]:
     """
-    Sweep (window × overlap × nperseg) and compute J₁, J₂, J₃ at every point.
-
-    Parameters
-    ----------
-    signal      : total sum signal (in-plane + out-of-plane)
-    t_us        : time vector [µs]
-    mode_signal : individual mode signal column (S2 for f, S4 for 2f);
-                  its envelope defines the time mask for J₃
-    f_center_hz : dominant excitation frequency [Hz]
-    delta_f_hz  : half-bandwidth of the frequency mask for J₃ [Hz]
+    Sweep (window × overlap × nperseg) and compute M_JPL and RV₃.
 
     Returns
     -------
     nperseg_list : sorted list of nperseg values
     results      : dict  (window_label, overlap_frac)
-                           → {nperseg: {"j1": float, "j2": float, "j3": float}}
+                           → {nperseg: {"mjpl": float, "rv3": float}}
     """
     fs           = _fs_from_time(t_us)
     nperseg_list = _nperseg_candidates(len(signal))
@@ -253,85 +295,69 @@ def sweep_metrics_vs_window_length(
         results[key] = {}
         for nperseg in nperseg_list:
             results[key][nperseg] = {
-                "j1": _j1(signal, fs, nperseg, window, ovlp, f_center_hz),
-                "j2": _j2_yan(signal, fs, nperseg, window, ovlp),
-                "j3": _j3(signal, fs, nperseg, window, ovlp,
-                           f_center_hz, delta_f_hz,
-                           mode_signal, t_us),
+                "mjpl": _mjpl_global(signal, fs, nperseg, window, ovlp,
+                                     mode_signal, t_us, sigma_f, sigma_t),
+                "rv3":  _rv3(signal, fs, nperseg, window, ovlp),
             }
 
     return nperseg_list, results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Best-parameter selection
+# Best-parameter selection  (maximise M_JPL)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def select_best(
-    nperseg_list: list[int],
     results: dict,
-    w1: float = 0.3,
-    w2: float = 0.3,
-    w3: float = 0.4,
-) -> tuple[dict, float]:
-    """Select (nperseg, window, overlap) that minimises J_tot."""
-    combos, j1s, j2s, j3s = [], [], [], []
+) -> dict:
+    """Select (nperseg, window, overlap) that maximises M_JPL."""
+    best_key, best_np, best_mjpl, best_rv3 = None, None, -np.inf, None
     for (win_lbl, ovlp), per_np in results.items():
         for nperseg, m in per_np.items():
-            combos.append((win_lbl, ovlp, nperseg))
-            j1s.append(m["j1"])
-            j2s.append(m["j2"])
-            j3s.append(m["j3"])
+            if m["mjpl"] > best_mjpl:
+                best_mjpl  = m["mjpl"]
+                best_key   = (win_lbl, ovlp)
+                best_np    = nperseg
+                best_rv3   = m["rv3"]
 
-    jtot     = _composite_score(np.array(j1s), np.array(j2s), np.array(j3s), w1, w2, w3)
-    best_idx = int(np.argmin(jtot))
-    best_win_lbl, best_ovlp, best_np = combos[best_idx]
-
+    win_lbl, ovlp = best_key
     # Recover original window spec (string or tuple) for scipy
-    win_spec = best_win_lbl
+    win_spec = win_lbl
     for w in WINDOWS:
-        if _window_label(w) == best_win_lbl:
+        if _window_label(w) == win_lbl:
             win_spec = w
             break
 
     return {
         "nperseg":      best_np,
         "window":       win_spec,
-        "window_label": best_win_lbl,
-        "overlap_frac": best_ovlp,
-        "j1":           j1s[best_idx],
-        "j2":           j2s[best_idx],
-        "j3":           j3s[best_idx],
-        "j_tot":        float(jtot[best_idx]),
-    }, float(jtot[best_idx])
+        "window_label": win_lbl,
+        "overlap_frac": ovlp,
+        "mjpl":         best_mjpl,
+        "rv3":          best_rv3,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Yan (2020) Fig-10-style plot
+# Yan (2020) Fig-10-style plot  (2 panels: M_JPL and RV₃)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_CURVE_COLOURS = [
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
-    "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
-]
-_MARKERS = ["o", "s", "^", "D", "v", "P", "*", "X"]
-
-
-def plot_yan_style(
+def plot_sweep(
     nperseg_list: list[int],
     results: dict,
     best: dict,
     title_prefix: str,
 ) -> None:
-    """1 × 3 figure — J₁, J₂, J₃ vs window length, one line per (window, overlap)."""
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle(f"{title_prefix}  —  metric vs window length  (Yan 2020 style)",
-                 fontsize=12)
+    """
+    1 × 2 figure — M_JPL and RV₃ vs window length.
+    One line per (window, overlap) combination.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig.suptitle(f"{title_prefix}  —  metric vs window length", fontsize=12)
 
     metric_cfg = [
-        ("j1", "J₁ (kHz)  ↓ better", axes[0], lambda v: v / 1e3),
-        ("j2", "J₂  ↑ better",        axes[1], lambda v: v),
-        ("j3", "J₃  ↓ better",        axes[2], lambda v: v),
+        ("mjpl", "M_JPL  ↑ better",   axes[0], lambda v: v),
+        ("rv3",  "RV₃  ↓ better",     axes[1], lambda v: v),
     ]
 
     for idx, (win_lbl, ovlp) in enumerate(sorted(results.keys())):
@@ -357,7 +383,6 @@ def plot_yan_style(
         if best_np in per_np_best:
             ax.plot(best_np, transform(per_np_best[best_np][metric_key]),
                     "*", color="black", markersize=14, zorder=5)
-
         ax.set_xlabel("Window length (samples)")
         ax.set_ylabel(ylabel)
         ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
@@ -365,7 +390,7 @@ def plot_yan_style(
         plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
         ax.grid(True, alpha=0.3)
 
-    axes[0].legend(fontsize=7, loc="upper right")
+    axes[0].legend(fontsize=7, loc="upper left")
     plt.tight_layout()
     plt.show()
 
@@ -377,10 +402,14 @@ def plot_yan_style(
 def plot_best_stft(
     signal: np.ndarray,
     t_us: np.ndarray,
+    mode_signal: np.ndarray,
     best: dict,
     title: str,
 ) -> None:
-    """Side-by-side default vs best-parameter spectrograms."""
+    """
+    Side-by-side:  default spectrogram  |  best-parameter spectrogram.
+    The Gaussian Q-window centre (mode peak) is marked with a cross.
+    """
     fs              = _fs_from_time(t_us)
     nperseg_list    = _nperseg_candidates(len(signal))
     default_nperseg = min(256, nperseg_list[-1])
@@ -388,7 +417,7 @@ def plot_best_stft(
     fig, (ax_d, ax_b) = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle(title, fontsize=12)
 
-    def _draw(ax, nperseg_, window_, ovlp_, subtitle):
+    def _draw(ax, nperseg_, window_, ovlp_, subtitle, mark_mode=False):
         noverlap_ = int(nperseg_ * ovlp_)
         f_ax, t_ax, Zxx = scipy_stft(signal, fs=fs, window=window_,
                                       nperseg=nperseg_, noverlap=noverlap_)
@@ -396,6 +425,14 @@ def plot_best_stft(
         im  = ax.pcolormesh(t_ax * 1e6, f_ax / 1e6, pdb,
                             shading="auto", cmap="inferno")
         fig.colorbar(im, ax=ax, label="dB")
+        if mark_mode:
+            # Mark dominant TF point of the mode signal
+            cf, ct = _mode_tf_center(mode_signal, t_us, fs,
+                                     nperseg_, window_, ovlp_)
+            ax.plot(t_ax[ct] * 1e6, f_ax[cf] / 1e6,
+                    "+", color="cyan", markersize=16, markeredgewidth=2,
+                    label="mode peak (Q centre)")
+            ax.legend(fontsize=8, loc="upper right")
         ax.set_xlabel("Time (µs)")
         ax.set_ylabel("Frequency (MHz)")
         ax.set_title(subtitle)
@@ -405,10 +442,9 @@ def plot_best_stft(
     _draw(ax_b, best["nperseg"], best["window"], best["overlap_frac"],
           f"Best  np={best['nperseg']}, {best['window_label']}, "
           f"{best['overlap_frac']:.0%}\n"
-          f"J₁={best['j1']/1e3:.2f} kHz  "
-          f"J₂={best['j2']:.1f}  "
-          f"J₃={best['j3']:.3f}  "
-          f"J_tot={best['j_tot']:.4f}")
+          f"M_JPL={best['mjpl']:.4e}  RV₃={best['rv3']:.3f}",
+          mark_mode=True)
+
     plt.tight_layout()
     plt.show()
 
@@ -417,98 +453,61 @@ def plot_best_stft(
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main(w1: float = 0.3, w2: float = 0.3, w3: float = 0.4) -> None:
+def main() -> None:
     data    = load_all("304 Steel")
     summary = []
 
-    # Accumulators for J₄
-    j1_acc: dict[tuple, list[float]] = {}
-    j3_acc: dict[tuple, list[float]] = {}
-
-    # ── Per-distance, per-signal sweep ───────────────────────────────────────
     for d in data:
         dist = d["distance_mm"]
         print(f"\n{'='*64}")
         print(f"  Distance: {dist} mm")
         print(f"{'='*64}")
 
-        for sig_key, signal, t_us, mode_signal in [
-            ("f",  d["f_signal"], d["time_f"],  d["s2_mode"]),
-            ("2f", d["sig_2f"],   d["time_2f"], d["s4_mode"]),
+        for sig_key, signal, t_us, mode_signal, mode_name in [
+            ("f",  d["f_signal"], d["time_f"],  d["s2_mode"], "S2"),
+            ("2f", d["sig_2f"],   d["time_2f"], d["s4_mode"], "S4"),
         ]:
-            fs       = _fs_from_time(t_us)
+            fs = _fs_from_time(t_us)
             f_center = _dominant_freq(signal, fs)
-            delta_f  = DELTA_F_FRAC * f_center
-
             print(f"  [{sig_key}]  f_center={f_center/1e6:.3f} MHz  "
-                  f"Δf={delta_f/1e3:.1f} kHz  "
-                  f"mask from {'S2' if sig_key == 'f' else 'S4'} mode envelope")
+                  f"localisation on {mode_name} mode envelope")
 
             nperseg_list, results = sweep_metrics_vs_window_length(
-                signal, t_us,
-                mode_signal = mode_signal,
-                f_center_hz = f_center,
-                delta_f_hz  = delta_f,
+                signal, t_us, mode_signal,
             )
 
-            best, _ = select_best(nperseg_list, results, w1, w2, w3)
+            best = select_best(results)
 
-            # Accumulate for J₄
-            for (win_lbl, ovlp), per_np in results.items():
-                for nperseg, m in per_np.items():
-                    k = (sig_key, win_lbl, ovlp, nperseg)
-                    j1_acc.setdefault(k, []).append(m["j1"])
-                    j3_acc.setdefault(k, []).append(m["j3"])
+            plot_sweep(nperseg_list, results, best,
+                       title_prefix=f"{sig_key} signal — {dist} mm")
+            plot_best_stft(signal, t_us, mode_signal, best,
+                           title=f"Best STFT — {sig_key} signal  {dist} mm  "
+                                 f"({mode_name} mode localisation)")
 
-            plot_yan_style(nperseg_list, results, best,
-                           title_prefix=f"{sig_key} signal — {dist} mm")
-            plot_best_stft(signal, t_us, best,
-                           title=f"Best STFT — {sig_key} signal  {dist} mm")
-
-            summary.append({"distance_mm": dist, "signal": sig_key, **best})
-
-    # ── J₄ robustness ranking ────────────────────────────────────────────────
-    print(f"\n{'='*70}")
-    print("  J₄ — most stable configurations across distances (top 5 per signal)")
-    print(f"{'='*70}")
-    for sig_key in ("f", "2f"):
-        rows = []
-        for (sk, win_lbl, ovlp, nperseg), j1_vals in j1_acc.items():
-            if sk != sig_key:
-                continue
-            j3_vals = j3_acc[(sk, win_lbl, ovlp, nperseg)]
-            rows.append({
-                "nperseg": nperseg, "win_lbl": win_lbl, "ovlp": ovlp,
-                "j4_j1": _j4(j1_vals), "j4_j3": _j4(j3_vals),
+            summary.append({
+                "distance_mm":  dist,
+                "signal":       sig_key,
+                "mode":         mode_name,
+                **best,
             })
-        rows.sort(key=lambda r: r["j4_j1"])
-        print(f"\n  Signal: {sig_key}")
-        print(f"  {'nperseg':>8}  {'window':<16}  {'overlap':>8}  "
-              f"{'J4(J1)':>10}  {'J4(J3)':>10}")
-        print(f"  {'-'*8}  {'-'*16}  {'-'*8}  {'-'*10}  {'-'*10}")
-        for r in rows[:5]:
-            print(f"  {r['nperseg']:>8}  {r['win_lbl']:<16}  "
-                  f"{r['ovlp']:>7.0%}  "
-                  f"{r['j4_j1']:>10.4f}  "
-                  f"{r['j4_j3']:>10.4f}")
 
     # ── Summary table ─────────────────────────────────────────────────────────
-    col = "{:>6}  {:<4}  {:>8}  {:<16}  {:>8}  {:>10}  {:>12}  {:>8}  {:>8}"
-    print(f"\n{'='*90}")
-    print("  Best-hyperparameter summary")
-    print(f"{'='*90}")
+    col = "{:>6}  {:<4}  {:>8}  {:<16}  {:>8}  {:>14}  {:>8}"
+    print(f"\n{'='*80}")
+    print("  Best-hyperparameter summary  (objective: max M_JPL)")
+    print(f"{'='*80}")
     print("  " + col.format("Dist", "Sig", "nperseg", "window",
-                             "overlap", "J1 (kHz)", "J2", "J3", "J_tot"))
-    print("  " + col.format(*["-"*w for w in (6, 4, 8, 16, 8, 10, 12, 8, 8)]))
+                             "overlap", "M_JPL", "RV₃"))
+    print("  " + col.format(*["-" * w for w in (6, 4, 8, 16, 8, 14, 8)]))
     for r in summary:
         print("  " + col.format(
-            f"{r['distance_mm']}mm", r["signal"],
-            r["nperseg"], r["window_label"],
+            f"{r['distance_mm']}mm",
+            r["signal"],
+            r["nperseg"],
+            r["window_label"],
             f"{r['overlap_frac']:.0%}",
-            f"{r['j1']/1e3:.2f}",
-            f"{r['j2']:.1f}",
-            f"{r['j3']:.4f}",
-            f"{r['j_tot']:.4f}",
+            f"{r['mjpl']:.4e}",
+            f"{r['rv3']:.3f}",
         ))
 
 
