@@ -55,12 +55,8 @@ OVERLAPS: tuple[float, ...] = (0.50, 0.25)
 N_NPERSEG: int = 10
 COLOURS: dict[str, str] = {"f": "#2563EB", "2f": "#DC2626"}
 
-# Placeholder mode group velocities [m/s] – update when dispersion curves are ready
-S2_GROUP_VEL_MS: float = 3200.0
-S4_GROUP_VEL_MS: float = 3500.0
-
 DELTA_F_FRAC: float = 0.10   # Δf = DELTA_F_FRAC × f_center
-DELTA_T_US: float   = 5.0    # µs
+ENVELOPE_THRESHOLD: float = 0.05  # fraction of peak envelope to define time mask
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -134,24 +130,43 @@ def _j2_yan(signal: np.ndarray, fs: float,
 def _j3(signal: np.ndarray, fs: float,
         nperseg: int, window, overlap_frac: float,
         f_center_hz: float,
-        mode_group_vel_ms: float,
-        distance_mm: float,
         delta_f_hz: float,
-        delta_t_us: float) -> float:
+        mode_signal: np.ndarray,
+        t_us: np.ndarray,
+        envelope_threshold: float = ENVELOPE_THRESHOLD) -> float:
     """
     J₃ — physics-based TF leakage ratio. ↓ better.
     J₃ = E_out / E_in
-    Mask: [f_center ± delta_f_hz] × [t_arrival ± delta_t_us]
-    t_arrival = distance_mm / (1000 × mode_group_vel_ms)  [µs]
+
+    The TF mask is built directly from the actual mode signal column
+    extracted from the Excel file (S2 for f, S4 for 2f):
+
+      Frequency mask : [f_center − Δf,  f_center + Δf]
+      Time mask      : contiguous region where |envelope(mode_signal)| ≥
+                       envelope_threshold × peak envelope
+
+    This avoids any assumption about group velocity.
     """
-    noverlap  = int(nperseg * overlap_frac)
+    # ── Time mask from mode signal envelope ──────────────────────────────
+    envelope = np.abs(mode_signal)
+    threshold = envelope_threshold * envelope.max() if envelope.max() > 0 else 0.0
+    above = envelope >= threshold
+    if not above.any():
+        # Mode is silent — mask covers full time range (conservative)
+        t_lo_us, t_hi_us = t_us[0], t_us[-1]
+    else:
+        idx = np.where(above)[0]
+        t_lo_us = float(t_us[idx[0]])
+        t_hi_us = float(t_us[idx[-1]])
+
+    # ── Compute STFT ─────────────────────────────────────────────────────────────────
+    noverlap = int(nperseg * overlap_frac)
     freqs, t_ax, Zxx = scipy_stft(signal, fs=fs, window=window,
                                    nperseg=nperseg, noverlap=noverlap)
-    t_us      = t_ax * 1e6
-    t_arr     = distance_mm / (1000.0 * mode_group_vel_ms)
+    t_stft_us = t_ax * 1e6
 
     f_mask  = (freqs >= f_center_hz - delta_f_hz) & (freqs <= f_center_hz + delta_f_hz)
-    t_mask  = (t_us  >= t_arr - delta_t_us)        & (t_us  <= t_arr + delta_t_us)
+    t_mask  = (t_stft_us >= t_lo_us) & (t_stft_us <= t_hi_us)
     in_mask = np.outer(f_mask, t_mask)
 
     power = np.abs(Zxx) ** 2
@@ -205,16 +220,23 @@ def _composite_score(j1_arr: np.ndarray, j2_arr: np.ndarray, j3_arr: np.ndarray,
 def sweep_metrics_vs_window_length(
     signal: np.ndarray,
     t_us: np.ndarray,
-    distance_mm: float,
-    mode_group_vel_ms: float,
+    mode_signal: np.ndarray,
     f_center_hz: float,
     delta_f_hz: float,
-    delta_t_us: float,
     overlaps: Sequence[float] = OVERLAPS,
     windows: list = WINDOWS,
 ) -> tuple[list[int], dict]:
     """
     Sweep (window × overlap × nperseg) and compute J₁, J₂, J₃ at every point.
+
+    Parameters
+    ----------
+    signal      : total sum signal (in-plane + out-of-plane)
+    t_us        : time vector [µs]
+    mode_signal : individual mode signal column (S2 for f, S4 for 2f);
+                  its envelope defines the time mask for J₃
+    f_center_hz : dominant excitation frequency [Hz]
+    delta_f_hz  : half-bandwidth of the frequency mask for J₃ [Hz]
 
     Returns
     -------
@@ -234,8 +256,8 @@ def sweep_metrics_vs_window_length(
                 "j1": _j1(signal, fs, nperseg, window, ovlp, f_center_hz),
                 "j2": _j2_yan(signal, fs, nperseg, window, ovlp),
                 "j3": _j3(signal, fs, nperseg, window, ovlp,
-                           f_center_hz, mode_group_vel_ms,
-                           distance_mm, delta_f_hz, delta_t_us),
+                           f_center_hz, delta_f_hz,
+                           mode_signal, t_us),
             }
 
     return nperseg_list, results
@@ -410,25 +432,23 @@ def main(w1: float = 0.3, w2: float = 0.3, w3: float = 0.4) -> None:
         print(f"  Distance: {dist} mm")
         print(f"{'='*64}")
 
-        for sig_key, signal, t_us, group_vel in [
-            ("f",  d["f_signal"], d["time_f"],  S2_GROUP_VEL_MS),
-            ("2f", d["sig_2f"],   d["time_2f"], S4_GROUP_VEL_MS),
+        for sig_key, signal, t_us, mode_signal in [
+            ("f",  d["f_signal"], d["time_f"],  d["s2_mode"]),
+            ("2f", d["sig_2f"],   d["time_2f"], d["s4_mode"]),
         ]:
             fs       = _fs_from_time(t_us)
             f_center = _dominant_freq(signal, fs)
             delta_f  = DELTA_F_FRAC * f_center
 
             print(f"  [{sig_key}]  f_center={f_center/1e6:.3f} MHz  "
-                  f"v_g={group_vel} m/s  Δf={delta_f/1e3:.1f} kHz  "
-                  f"Δt={DELTA_T_US} µs")
+                  f"Δf={delta_f/1e3:.1f} kHz  "
+                  f"mask from {'S2' if sig_key == 'f' else 'S4'} mode envelope")
 
             nperseg_list, results = sweep_metrics_vs_window_length(
                 signal, t_us,
-                distance_mm       = dist,
-                mode_group_vel_ms = group_vel,
-                f_center_hz       = f_center,
-                delta_f_hz        = delta_f,
-                delta_t_us        = DELTA_T_US,
+                mode_signal = mode_signal,
+                f_center_hz = f_center,
+                delta_f_hz  = delta_f,
             )
 
             best, _ = select_best(nperseg_list, results, w1, w2, w3)

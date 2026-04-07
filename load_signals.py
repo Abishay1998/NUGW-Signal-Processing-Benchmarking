@@ -6,8 +6,10 @@ Loads simulated guided wave signals from the 'Simulated Signals' folder.
 For each propagation distance the function returns:
   - time_f   : time vector for the fundamental frequency (µs)
   - f_signal : sum of In-plane + Out-of-plane 'Sum Propagated signal' at f
+  - s2_mode  : sum of In-plane + Out-of-plane 'S2 Propagated signal' at f
   - time_2f  : time vector for the second harmonic frequency (µs)
   - sig_2f   : sum of In-plane + Out-of-plane 'Sum Propagated signal' at 2f
+  - s4_mode  : sum of In-plane + Out-of-plane 'S4 Propagated signal' at 2f
 
 File naming convention (inside each <distance>/ folder):
   In-plane_TemporalResponse@...          → fundamental, in-plane
@@ -56,6 +58,39 @@ def _read_time_and_sum(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
     wb.close()
     return np.array(time_vals), np.array(sig_vals)
+
+
+def _read_named_column(path: Path, col_name: str) -> np.ndarray:
+    """
+    Read a single named column from an Excel file, skipping the header row.
+    Raises KeyError if the column header is not found.
+
+    Returns
+    -------
+    values : ndarray (nm)
+    """
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+
+    # Find column index (1-based) by matching header text
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    col_idx = next(
+        (i for i, h in enumerate(headers) if h and col_name in str(h)), None
+    )
+    if col_idx is None:
+        wb.close()
+        raise KeyError(
+            f"Column '{col_name}' not found in {path.name}.\n"
+            f"Available columns: {headers}"
+        )
+
+    vals = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        v = row[col_idx]
+        if v is not None:
+            vals.append(float(v))
+    wb.close()
+    return np.array(vals)
 
 
 def load_distance(distance_dir: Path) -> dict:
@@ -111,6 +146,12 @@ def load_distance(distance_dir: Path) -> dict:
     f_signal = ip_f_sig + oop_f_sig
     sig_2f   = ip_2f_sig + oop_2f_sig
 
+    # Load individual mode columns for mask construction in J3
+    s2_mode = (_read_named_column(ip_f,  "S2 Propagated signal")
+               + _read_named_column(oop_f, "S2 Propagated signal"))
+    s4_mode = (_read_named_column(ip_2f,  "S4 Propagated signal")
+               + _read_named_column(oop_2f, "S4 Propagated signal"))
+
     # Parse distance from folder name (e.g. "200mm" → 200)
     distance_mm = int("".join(filter(str.isdigit, distance_dir.name)))
 
@@ -118,8 +159,10 @@ def load_distance(distance_dir: Path) -> dict:
         "distance_mm": distance_mm,
         "time_f":      time_f,
         "f_signal":    f_signal,
+        "s2_mode":     s2_mode,
         "time_2f":     time_2f,
         "sig_2f":      sig_2f,
+        "s4_mode":     s4_mode,
     }
 
 
@@ -134,7 +177,7 @@ def load_all(material: str = "304 Steel") -> list[dict]:
     Returns
     -------
     List of dicts (one per distance), sorted by distance_mm.
-    Each dict has keys: distance_mm, time_f, f_signal, time_2f, sig_2f.
+    Each dict has keys: distance_mm, time_f, f_signal, s2_mode, time_2f, sig_2f, s4_mode.
     """
     material_dir = DATA_ROOT / material
     if not material_dir.exists():
