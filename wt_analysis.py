@@ -215,10 +215,11 @@ def plot_best_cwt(signal: np.ndarray, t_us: np.ndarray,
 
     def _draw(ax, wav, nv, subtitle, mark_mode=False):
         freqs, times, power = _cwt(signal, fs, wav, nv)
-        pdb = 10 * np.log10(power + 1e-30)
-        im  = ax.pcolormesh(times * 1e6, freqs / 1e6, pdb,
-                            shading="auto", cmap="inferno")
-        fig.colorbar(im, ax=ax, label="dB")
+        pdb  = 10 * np.log10(power / (power.max() + 1e-30) + 1e-30)
+        im   = ax.pcolormesh(times * 1e6, freqs / 1e6, pdb,
+                             shading="auto", cmap="inferno",
+                             vmin=-50, vmax=0)
+        fig.colorbar(im, ax=ax, label="Power (dB, rel. max)")
         ax.set_ylim(0, FREQ_MAX_MHZ)
         if mark_mode:
             cf, ct = _mode_tf_center(mode_signal, fs, wav, nv)

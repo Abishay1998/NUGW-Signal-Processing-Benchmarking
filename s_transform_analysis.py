@@ -220,10 +220,12 @@ def plot_best_st(signal: np.ndarray, t_us: np.ndarray,
     def _draw(ax, p, subtitle, mark_mode=False):
         freqs, times, Sm = _stockwell(signal, fs, p=p,
                                        freq_max_hz=FREQ_MAX_MHZ * 1e6)
-        pdb = 20 * np.log10(np.abs(Sm) + 1e-12)
-        im  = ax.pcolormesh(times * 1e6, freqs / 1e6, pdb,
-                            shading="auto", cmap="inferno")
-        fig.colorbar(im, ax=ax, label="dB")
+        mag  = np.abs(Sm)
+        pdb  = 20 * np.log10(mag / (mag.max() + 1e-12) + 1e-12)
+        im   = ax.pcolormesh(times * 1e6, freqs / 1e6, pdb,
+                             shading="auto", cmap="inferno",
+                             vmin=-50, vmax=0)
+        fig.colorbar(im, ax=ax, label="Power (dB, rel. max)")
         ax.set_ylim(0, FREQ_MAX_MHZ)
         if mark_mode:
             cf, ct = _mode_tf_center(mode_signal, fs, p)

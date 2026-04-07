@@ -305,10 +305,11 @@ def plot_best_sst_stft(signal: np.ndarray, t_us: np.ndarray,
             ax.text(0.5, 0.5, str(e), transform=ax.transAxes, ha="center")
             ax.set_title(subtitle)
             return
-        pdb = 10 * np.log10(power + 1e-30)
-        im  = ax.pcolormesh(times * 1e6, freqs / 1e6, pdb,
-                            shading="auto", cmap="inferno")
-        fig.colorbar(im, ax=ax, label="dB")
+        pdb  = 10 * np.log10(power / (power.max() + 1e-30) + 1e-30)
+        im   = ax.pcolormesh(times * 1e6, freqs / 1e6, pdb,
+                             shading="auto", cmap="inferno",
+                             vmin=-50, vmax=0)
+        fig.colorbar(im, ax=ax, label="Power (dB, rel. max)")
         ax.set_ylim(0, FREQ_MAX_MHZ)
         if mark_mode:
             try:

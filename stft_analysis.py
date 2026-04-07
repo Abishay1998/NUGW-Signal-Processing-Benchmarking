@@ -421,10 +421,12 @@ def plot_best_stft(
         noverlap_ = int(nperseg_ * ovlp_)
         f_ax, t_ax, Zxx = scipy_stft(signal, fs=fs, window=window_,
                                       nperseg=nperseg_, noverlap=noverlap_)
-        pdb = 20 * np.log10(np.abs(Zxx) + 1e-12)
-        im  = ax.pcolormesh(t_ax * 1e6, f_ax / 1e6, pdb,
-                            shading="auto", cmap="inferno")
-        fig.colorbar(im, ax=ax, label="dB")
+        mag  = np.abs(Zxx)
+        pdb  = 20 * np.log10(mag / (mag.max() + 1e-12) + 1e-12)
+        im   = ax.pcolormesh(t_ax * 1e6, f_ax / 1e6, pdb,
+                             shading="auto", cmap="inferno",
+                             vmin=-50, vmax=0)
+        fig.colorbar(im, ax=ax, label="Power (dB, rel. max)")
         if mark_mode:
             # Mark dominant TF point of the mode signal
             cf, ct = _mode_tf_center(mode_signal, t_us, fs,
@@ -435,6 +437,7 @@ def plot_best_stft(
             ax.legend(fontsize=8, loc="upper right")
         ax.set_xlabel("Time (µs)")
         ax.set_ylabel("Frequency (MHz)")
+        ax.set_ylim(0, 3)
         ax.set_title(subtitle)
 
     _draw(ax_d, default_nperseg, "hann", 0.75,
