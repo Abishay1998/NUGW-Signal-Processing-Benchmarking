@@ -224,7 +224,7 @@ def plot_best_st(signal: np.ndarray, t_us: np.ndarray,
         pdb  = 20 * np.log10(mag / (mag.max() + 1e-12) + 1e-12)
         im   = ax.pcolormesh(times * 1e6, freqs / 1e6, pdb,
                              shading="auto", cmap="inferno",
-                             vmin=-50, vmax=0)
+                             vmin=-50, vmax=0, cmap="jet")
         fig.colorbar(im, ax=ax, label="Power (dB, rel. max)")
         ax.set_ylim(0, FREQ_MAX_MHZ)
         if mark_mode:

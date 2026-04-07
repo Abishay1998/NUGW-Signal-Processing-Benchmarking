@@ -425,7 +425,7 @@ def plot_best_stft(
         pdb  = 20 * np.log10(mag / (mag.max() + 1e-12) + 1e-12)
         im   = ax.pcolormesh(t_ax * 1e6, f_ax / 1e6, pdb,
                              shading="auto", cmap="inferno",
-                             vmin=-50, vmax=0)
+                             vmin=-50, vmax=0, cmap="jet")
         fig.colorbar(im, ax=ax, label="Power (dB, rel. max)")
         if mark_mode:
             # Mark dominant TF point of the mode signal
