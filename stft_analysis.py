@@ -33,14 +33,17 @@ Real-Time Application to High-Rate Dynamic Systems", Vibration 2020, 3.
         is the dominant FFT frequency of the full signal (known for
         simulated data).
 
-  J₂  =  ∬ log|TFR(t,ω)|³ dt dω      (Rényi entropy / energy concentration)
+  J₂  =  ∬ log( |TFR(t,ω)|³ / Z ) dt dω      (normalised Rényi entropy)
 
-        Higher is better. Rewards a sharp, concentrated TF distribution.
-        Penalises smearing regardless of where energy sits in the TF plane.
+        Z = ∬ |TFR(t,ω)|³ dt dω  normalises the distribution so J₂ is
+        independent of TF plane size and signal amplitude.
+        Higher (less negative) is better: rewards a sharp, concentrated
+        TF distribution and penalises smearing across the TF plane.
 
-The grid search maximises J₂ (energy concentration) because it requires
-no external ground-truth frequency tracking on a per-window basis.
-J₁ is computed once for the best configuration as a validation metric.
+The grid search minimises J₁ (IF tracking error) — directly optimises how
+accurately the STFT tracks the known excitation frequency, which is available
+for simulated data.  J₂ is then computed at the best configuration as a
+reporting metric for cross-method comparison (as used by Jin Yan).
 """
 
 from __future__ import annotations
@@ -78,18 +81,24 @@ def _nperseg_candidates(n_samples: int) -> list[int]:
 def _j2(signal: np.ndarray, fs: float,
           nperseg: int, window, overlap_frac: float) -> float:
     """
-    J₂ — Rényi entropy (Jin Yan 2020, eq. 8).
-    J₂ = ∬ log|TFR(t,ω)|³ dt dω
-    Higher is better: a sharp, concentrated TF distribution gives a larger value.
+    J₂ — Rényi entropy (Jin Yan 2020, eq. 8), normalised form.
+    J₂ = ∬ log( |TFR(t,ω)|³ / Z ) dt dω,   Z = ∬ |TFR(t,ω)|³ dt dω
+
+    Normalising by Z turns |TFR|³ into a probability-like distribution,
+    so J₂ measures *concentration* independently of TF plane size or
+    signal amplitude.  Higher (less negative) = sharper distribution.
     """
     noverlap = int(nperseg * overlap_frac)
     _, _, Zxx = stft(signal, fs=fs, window=window,
                      nperseg=nperseg, noverlap=noverlap)
-    magnitude = np.abs(Zxx)
-    # Avoid log(0): add small floor relative to max magnitude
-    floor = 1e-12 * magnitude.max() if magnitude.max() > 0 else 1e-12
-    magnitude = np.maximum(magnitude, floor)
-    return float(np.sum(np.log(magnitude ** 3)))
+    p = np.abs(Zxx) ** 3                          # |TFR|³  (freq × time)
+    z = p.sum()
+    if z == 0:
+        return -np.inf
+    p_norm = p / z                                 # normalise → sums to 1
+    # Avoid log(0)
+    p_norm = np.maximum(p_norm, 1e-300)
+    return float(np.sum(np.log(p_norm)))
 
 
 def _j1(signal: np.ndarray, fs: float,
@@ -135,18 +144,18 @@ def optimise_and_plot(
     fft_freq = np.fft.rfftfreq(len(signal), d=1.0 / fs)
     true_freq_hz = float(fft_freq[np.argmax(fft_mag)])
 
-    # ── Grid search — maximise J₂ (Rényi entropy) ────────────────────────────
-    results = []   # (j2_score, nperseg, window, overlap_frac)
+    # ── Grid search — minimise J₁ (mean IF tracking error) ──────────────────
+    results = []   # (j1_score, nperseg, window, overlap_frac)
     for nperseg, window, ovlp in itertools.product(
             nperseg_list, WINDOWS, OVERLAP_FRACS):
-        score = _j2(signal, fs, nperseg, window, ovlp)
+        score = _j1(signal, fs, nperseg, window, ovlp, true_freq_hz)
         results.append((score, nperseg, window, ovlp))
 
-    results.sort(key=lambda x: -x[0])
-    best_j2, best_nperseg, best_window, best_ovlp = results[0]
+    results.sort(key=lambda x: x[0])   # ascending — lower J₁ is better
+    best_j1, best_nperseg, best_window, best_ovlp = results[0]
 
-    # J₁ for best configuration (validation metric — lower is better)
-    best_j1 = _j1(signal, fs, best_nperseg, best_window, best_ovlp, true_freq_hz)
+    # J₂ at best configuration (reporting metric for cross-method comparison)
+    best_j2 = _j2(signal, fs, best_nperseg, best_window, best_ovlp)
 
     # ── Figure layout ─────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(16, 10))
@@ -159,50 +168,50 @@ def optimise_and_plot(
     ax_stft_d = fig.add_subplot(gs[1, :2])  # default STFT
     ax_stft_b = fig.add_subplot(gs[1, 2])   # best STFT
 
-    # ── Panel 1: J₂ vs nperseg ───────────────────────────────────────────────
+    # ── Panel 1: J₁ vs nperseg ───────────────────────────────────────────────
     nperseg_scores: dict[int, list] = {}
     for score, np_, win, ovlp in results:
         nperseg_scores.setdefault(np_, []).append(score)
     np_vals = sorted(nperseg_scores)
     np_means = [np.mean(nperseg_scores[v]) for v in np_vals]
-    ax_score.plot(np_vals, np_means, "o-", color=colour)
+    ax_score.plot(np_vals, [v / 1e3 for v in np_means], "o-", color=colour)
     ax_score.axvline(best_nperseg, color="gray", linestyle="--", alpha=0.6)
     ax_score.set_xlabel("nperseg (samples)")
-    ax_score.set_ylabel("Mean J₂ (Rényi entropy)")
-    ax_score.set_title("J₂ vs window length")
+    ax_score.set_ylabel("Mean J₁ (kHz)  ↓ better")
+    ax_score.set_title("J₁ vs window length")
     ax_score.set_xscale("log", base=2)
     ax_score.grid(True, alpha=0.3)
 
-    # ── Panel 2: J₂ vs window type ───────────────────────────────────────────
+    # ── Panel 2: J₁ vs window type ───────────────────────────────────────────
     win_scores: dict[str, list] = {}
     for score, np_, win, ovlp in results:
         wl = _window_label(win)
         win_scores.setdefault(wl, []).append(score)
     win_labels = list(win_scores)
-    win_means  = [np.mean(win_scores[w]) for w in win_labels]
+    win_means  = [np.mean(win_scores[w]) / 1e3 for w in win_labels]
     bars = ax_win.bar(win_labels, win_means, color=colour, alpha=0.8)
     best_wl = _window_label(best_window)
     for bar, wl in zip(bars, win_labels):
         if wl == best_wl:
             bar.set_edgecolor("black")
             bar.set_linewidth(2)
-    ax_win.set_ylabel("Mean J₂ (Rényi entropy)")
-    ax_win.set_title("J₂ vs window function")
-    ax_win.set_ylim(min(win_means) * 1.02, max(win_means) * 1.02)
+    ax_win.set_ylabel("Mean J₁ (kHz)  ↓ better")
+    ax_win.set_title("J₁ vs window function")
+    ax_win.set_ylim(0, max(win_means) * 1.15)
     ax_win.grid(True, axis="y", alpha=0.3)
 
-    # ── Panel 3: J₂ vs overlap_frac ──────────────────────────────────────────
+    # ── Panel 3: J₁ vs overlap_frac ──────────────────────────────────────────
     ovlp_scores: dict[float, list] = {}
     for score, np_, win, ovlp in results:
         ovlp_scores.setdefault(ovlp, []).append(score)
     ovlp_vals  = sorted(ovlp_scores)
-    ovlp_means = [np.mean(ovlp_scores[v]) for v in ovlp_vals]
+    ovlp_means = [np.mean(ovlp_scores[v]) / 1e3 for v in ovlp_vals]
     ax_ovlp.plot([f"{v:.0%}" for v in ovlp_vals], ovlp_means, "s-", color=colour)
     best_ovlp_label = f"{best_ovlp:.0%}"
     ax_ovlp.axvline(best_ovlp_label, color="gray", linestyle="--", alpha=0.6)
     ax_ovlp.set_xlabel("Overlap fraction")
-    ax_ovlp.set_ylabel("Mean J₂ (Rényi entropy)")
-    ax_ovlp.set_title("J₂ vs overlap fraction")
+    ax_ovlp.set_ylabel("Mean J₁ (kHz)  ↓ better")
+    ax_ovlp.set_title("J₁ vs overlap fraction")
     ax_ovlp.grid(True, alpha=0.3)
 
     # ── Panel 4: Default STFT (hann, nperseg=256, overlap=0.75) ──────────────
@@ -224,7 +233,7 @@ def optimise_and_plot(
     _plot_stft(ax_stft_b, best_nperseg, best_window, best_ovlp,
                f"Best STFT  (nperseg={best_nperseg}, "
                f"{_window_label(best_window)}, {best_ovlp:.0%} overlap)\n"
-               f"J₂={best_j2:.1f}  |  J₁={best_j1/1e3:.2f} kHz")
+               f"J\u2081={best_j1/1e3:.2f} kHz  |  J\u2082={best_j2:.1f}")
 
     plt.show()
 
